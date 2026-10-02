@@ -1,0 +1,8 @@
+{
+  "name": "argenfunds-monitor",
+  "private": true,
+  "description": "Dependencias de las funciones de Netlify del monitor (almacenamiento de datos de 1816).",
+  "dependencies": {
+    "@netlify/blobs": "8.2.0"
+  }
+}
