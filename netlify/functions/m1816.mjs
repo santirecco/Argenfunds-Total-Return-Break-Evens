@@ -12,9 +12,9 @@ import { getStore } from '@netlify/blobs';
 //   ?q=snap&grupo=sob|prov&moneda=mep|ccl[&dia=prev]
 //   ?q=hist&ticker=AL30           (TIR de 1 año, MEP, fuente BYMA)
 //   ?q=bal                         (saldo de créditos, no consume créditos)
-//   ?q=extraer                     (UNA VEZ: flujos de los 45 bonos + foto de 1816 +
-//                                   paneles de data912, para calcular sin 1816. ~1.300
-//                                   créditos; queda guardado 7 días y no se repite)
+//   ?q=extraer                     (UNA VEZ: página que baja los flujos de fondos de los
+//                                   45 bonos de a uno, guarda el progreso y al terminar
+//                                   ofrece descargar flujos_bonos_1816.json)
 
 const API = 'https://api.1816.com.ar/v1';
 
@@ -143,6 +143,35 @@ function respond(status, body, ttl) {
   return new Response(JSON.stringify(body), { status, headers: h });
 }
 
+// Página de progreso de la extracción (se sirve con ?q=extraer)
+const PAGINA_EXTRAER = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Extracción de flujos · 1816</title><style>
+body{margin:0;background:#070F1A;color:#CBD9E7;font:14px/1.5 Inter,system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.c{width:min(560px,92vw);background:#0F1C2B;border:1px solid #243A52;border-radius:12px;padding:26px 28px}
+h1{font-size:17px;margin:0 0 6px}p{margin:6px 0;color:#82A0BB}.bar{height:10px;border-radius:5px;background:#16273A;overflow:hidden;margin:18px 0 8px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#1FD4B4,#5BA0F2);transition:width .3s}
+#est{font-weight:600;color:#CBD9E7}#err{font-size:12px;color:#F0A53E;margin-top:10px}
+a.b{display:none;margin-top:18px;padding:10px 16px;border-radius:8px;background:rgba(47,214,140,.14);border:1px solid rgba(47,214,140,.5);color:#2FD68C;font-weight:700;text-decoration:none}
+</style></head><body><div class="c"><h1>Bajando los flujos de fondos de 1816</h1>
+<p>Va de a un bono por vez para respetar el límite de 1816. Dejá esta página abierta; tarda uno o dos minutos.</p>
+<div class="bar"><i id="b"></i></div><div id="est">Empezando…</div><div id="err"></div>
+<a class="b" id="d" href="?q=extraer&descargar=1">Descargar flujos_bonos_1816.json</a></div>
+<script>
+async function paso(){
+  try{
+    const r=await fetch('?q=extraer&paso=1',{cache:'no-store'}); const j=await r.json();
+    if(!r.ok){document.getElementById('est').textContent='Error: '+(j.error||r.status);setTimeout(paso,4000);return;}
+    const hechos=j.total-j.faltan; document.getElementById('b').style.width=(hechos/j.total*100).toFixed(0)+'%';
+    document.getElementById('est').textContent=hechos+' de '+j.total+' listos · '+j.creditos+' créditos usados'+(j.pausa?' · '+j.pausa:'');
+    const e=Object.entries(j.errores||{}).filter(([k,v])=>v.definitivo);
+    document.getElementById('err').textContent=e.length?'Sin flujos en 1816: '+e.map(([k])=>k).join(', '):'';
+    if(j.listo){document.getElementById('est').textContent='Listo: '+j.bajados+' bonos con flujos · '+j.creditos+' créditos usados.';document.getElementById('d').style.display='inline-block';return;}
+    setTimeout(paso,j.pausa?3000:600);
+  }catch(e){document.getElementById('est').textContent='Reintentando…';setTimeout(paso,3000);}
+}
+paso();
+</script></body></html>`;
+
 export default async (req) => {
   const u = new URL(req.url), p = u.searchParams, q = p.get('q'), now = new Date();
   try {
@@ -183,53 +212,47 @@ export default async (req) => {
       return respond(200, Object.assign({}, r.body, { _meta: r.meta }), Math.min(ttl, 3600));
     }
     if (q === 'extraer') {
-      const r = await guardado('extraer-v1', 7 * 86400, async () => {
-        const out = { generado: now.toISOString(), instrumentos: {}, cashflow: {}, errores: {}, foto1816: null, data912: {} };
-        let creditos = 0;
-        // 1. Metadatos de las tres curvas (Bonares, Globales, Provinciales USD)
-        for (const id of [8, 11, 18]) {
-          try { const x = await call('/mercado/instrumentos', { curvaId: id, soloPerforming: 'true' }); out.instrumentos[id] = x.json; creditos += 1; }
-          catch (e) { out.errores['curva' + id] = e.message; }
+      // Extracción de flujos de fondos, de a un bono por vez y con pausas (1816 limita la
+      // frecuencia). Avanza por tandas de ~7 s y guarda el progreso: la página que se abre
+      // con ?q=extraer va pidiendo tandas sola hasta terminar y ofrece descargar el archivo.
+      const st = store();
+      if (!st) return respond(500, { error: 'No está disponible el almacenamiento del sitio (Netlify Blobs).' });
+      const TODOS = SOB.concat(PROV), CURVAS = [8, 11, 18];
+      const camposCF = ['fechaPagoEfectiva', 'fechaPagoTeorica', 'flujoAmortizacion', 'flujoInteres', 'flujoTotal'];
+      let prog = null; try { prog = await st.get('cf-v2', { type: 'json' }); } catch (e) {}
+      if (!prog) prog = { cashflow: {}, instrumentos: {}, errores: {}, creditos: 0, inicio: now.toISOString() };
+      const faltan = () => TODOS.filter((t) => !prog.cashflow[t] && !(prog.errores[t] && prog.errores[t].definitivo)).length
+                         + CURVAS.filter((id) => !prog.instrumentos[id]).length;
+      if (p.get('descargar')) {
+        return new Response(JSON.stringify(prog), { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
+          'Content-Disposition': 'attachment; filename="flujos_bonos_1816.json"' } });
+      }
+      if (!p.get('paso')) return new Response(PAGINA_EXTRAER, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+      const t0 = Date.now(), dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+      let usados = 0; try { const c = await st.get('creditos-' + isoAR(now), { type: 'json' }); usados = (c && c.usados) || 0; } catch (e) {}
+      let gasto = 0, pausa = null;
+      const tareas = CURVAS.filter((id) => !prog.instrumentos[id]).map((id) => ['curva', id])
+        .concat(TODOS.filter((t) => !prog.cashflow[t] && !(prog.errores[t] && prog.errores[t].definitivo)).map((t) => ['cf', t]));
+      for (const [tipo, id] of tareas) {
+        if (Date.now() - t0 > 7000) break;
+        if (usados + gasto >= tope()) { pausa = 'Se alcanzó el tope diario de créditos del monitor.'; break; }
+        try {
+          if (tipo === 'curva') { const x = await call('/mercado/instrumentos', { curvaId: id, soloPerforming: 'true' }); prog.instrumentos[id] = x.json; gasto += 1; }
+          else { const x = await call('/mercado/cashflow/' + encodeURIComponent(id), { campos: camposCF }); prog.cashflow[id] = x.json; delete prog.errores[id];
+            gasto += x.credits || ((x.json && x.json.cashflow && x.json.cashflow.length) || 1); }
+        } catch (e) {
+          if (e.status === 429) { pausa = '1816 pidió bajar el ritmo: se retoma en unos segundos.'; await dormir(2500); break; }
+          if (e.status === 402) { pausa = e.message; break; }
+          prog.errores[id] = { msg: e.message, definitivo: /respondió 4\d\d/.test(e.message) };
         }
-        // 2. Flujos de fondos de cada bono (de a 8 en paralelo)
-        const todos = SOB.concat(PROV), cola = todos.slice();
-        const campos = ['fechaPagoEfectiva', 'fechaPagoTeorica', 'flujoAmortizacion', 'flujoInteres', 'flujoTotal'];
-        async function trabajador() {
-          while (cola.length) {
-            const t = cola.shift();
-            try { const x = await call('/mercado/cashflow/' + encodeURIComponent(t), { campos }); out.cashflow[t] = x.json;
-              creditos += x.credits || ((x.json && x.json.cashflow && x.json.cashflow.length) || 1); }
-            catch (e) { out.errores[t] = e.message; }
-          }
-        }
-        await Promise.all(Array.from({ length: 8 }, trabajador));
-        // 3. Foto de 1816 (para validar el cálculo propio con sus mismos precios)
-        let fecha = habil(now) && minutosAR(now) >= 10 * 60 + 55 ? now : prevHabil(now);
-        const camposF = ['precioClean', 'precioDirty', 'tea', 'duration', 'durationMod', 'paridad', 'currentYield', 'fechaLiquidacion', 'ultimaOperacion'];
-        for (let i = 0; i < 4; i++) {
-          try {
-            const x = await call('/mercado/indicadores', { tickers: todos, campos: camposF, fuente: 'byma', moneda: 'mep', plazo: 1, fechaOperacion: isoAR(fecha) });
-            creditos += x.credits || todos.length * camposF.length; out.foto1816 = x.json;
-            if (!vacio(x.json && x.json.instrumentos)) break;
-          } catch (e) { out.errores.foto1816 = e.message; break; }
-          fecha = prevHabil(fecha);
-        }
-        // 4. data912 en el mismo momento (paneles completos + muestra de historia)
-        const D = 'https://data912.com';
-        for (const [k, path] of [['arg_bonds', '/live/arg_bonds'], ['arg_corp', '/live/arg_corp'], ['mep', '/live/mep'], ['ccl', '/live/ccl'], ['hist_AL30D', '/historical/bonds/AL30D'], ['hist_BA37D', '/historical/bonds/BA37D']]) {
-          try {
-            const rr = await fetch(D + path, { headers: { Accept: 'application/json' } });
-            let j = await rr.json().catch(() => null);
-            if (Array.isArray(j) && k.indexOf('hist_') === 0) j = { total: j.length, primeros: j.slice(0, 3), ultimos: j.slice(-5) };
-            out.data912[k] = rr.ok ? j : { error: 'HTTP ' + rr.status };
-          } catch (e) { out.data912[k] = { error: e.message }; }
-        }
-        out.creditos = creditos;
-        return { body: out, creditos };
-      }, now);
-      return new Response(JSON.stringify(Object.assign({}, r.body, { _meta: r.meta })), { status: 200, headers: {
-        'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
-        'Content-Disposition': 'attachment; filename="extraccion_bonos_1816_data912.json"' } });
+        await dormir(400);
+      }
+      prog.creditos += gasto;
+      try { await st.setJSON('cf-v2', prog); } catch (e) {}
+      if (gasto) { try { await st.setJSON('creditos-' + isoAR(now), { usados: usados + gasto }); } catch (e) {} }
+      const f = faltan();
+      return respond(200, { total: TODOS.length + CURVAS.length, faltan: f, listo: f === 0, pausa,
+        bajados: Object.keys(prog.cashflow).length, errores: prog.errores, creditos: prog.creditos });
     }
     if (q === 'bal') {
       const r = await call('/creditos/balance', {});
