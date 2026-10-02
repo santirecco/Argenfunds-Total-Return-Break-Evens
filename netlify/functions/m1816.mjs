@@ -12,6 +12,9 @@ import { getStore } from '@netlify/blobs';
 //   ?q=snap&grupo=sob|prov&moneda=mep|ccl[&dia=prev]
 //   ?q=hist&ticker=AL30           (TIR de 1 año, MEP, fuente BYMA)
 //   ?q=bal                         (saldo de créditos, no consume créditos)
+//   ?q=extraer                     (UNA VEZ: flujos de los 45 bonos + foto de 1816 +
+//                                   paneles de data912, para calcular sin 1816. ~1.300
+//                                   créditos; queda guardado 7 días y no se repite)
 
 const API = 'https://api.1816.com.ar/v1';
 
@@ -178,6 +181,55 @@ export default async (req) => {
         return { body: x.json, creditos: x.credits || n };
       }, now);
       return respond(200, Object.assign({}, r.body, { _meta: r.meta }), Math.min(ttl, 3600));
+    }
+    if (q === 'extraer') {
+      const r = await guardado('extraer-v1', 7 * 86400, async () => {
+        const out = { generado: now.toISOString(), instrumentos: {}, cashflow: {}, errores: {}, foto1816: null, data912: {} };
+        let creditos = 0;
+        // 1. Metadatos de las tres curvas (Bonares, Globales, Provinciales USD)
+        for (const id of [8, 11, 18]) {
+          try { const x = await call('/mercado/instrumentos', { curvaId: id, soloPerforming: 'true' }); out.instrumentos[id] = x.json; creditos += 1; }
+          catch (e) { out.errores['curva' + id] = e.message; }
+        }
+        // 2. Flujos de fondos de cada bono (de a 8 en paralelo)
+        const todos = SOB.concat(PROV), cola = todos.slice();
+        const campos = ['fechaPagoEfectiva', 'fechaPagoTeorica', 'flujoAmortizacion', 'flujoInteres', 'flujoTotal'];
+        async function trabajador() {
+          while (cola.length) {
+            const t = cola.shift();
+            try { const x = await call('/mercado/cashflow/' + encodeURIComponent(t), { campos }); out.cashflow[t] = x.json;
+              creditos += x.credits || ((x.json && x.json.cashflow && x.json.cashflow.length) || 1); }
+            catch (e) { out.errores[t] = e.message; }
+          }
+        }
+        await Promise.all(Array.from({ length: 8 }, trabajador));
+        // 3. Foto de 1816 (para validar el cálculo propio con sus mismos precios)
+        let fecha = habil(now) && minutosAR(now) >= 10 * 60 + 55 ? now : prevHabil(now);
+        const camposF = ['precioClean', 'precioDirty', 'tea', 'duration', 'durationMod', 'paridad', 'currentYield', 'fechaLiquidacion', 'ultimaOperacion'];
+        for (let i = 0; i < 4; i++) {
+          try {
+            const x = await call('/mercado/indicadores', { tickers: todos, campos: camposF, fuente: 'byma', moneda: 'mep', plazo: 1, fechaOperacion: isoAR(fecha) });
+            creditos += x.credits || todos.length * camposF.length; out.foto1816 = x.json;
+            if (!vacio(x.json && x.json.instrumentos)) break;
+          } catch (e) { out.errores.foto1816 = e.message; break; }
+          fecha = prevHabil(fecha);
+        }
+        // 4. data912 en el mismo momento (paneles completos + muestra de historia)
+        const D = 'https://data912.com';
+        for (const [k, path] of [['arg_bonds', '/live/arg_bonds'], ['arg_corp', '/live/arg_corp'], ['mep', '/live/mep'], ['ccl', '/live/ccl'], ['hist_AL30D', '/historical/bonds/AL30D'], ['hist_BA37D', '/historical/bonds/BA37D']]) {
+          try {
+            const rr = await fetch(D + path, { headers: { Accept: 'application/json' } });
+            let j = await rr.json().catch(() => null);
+            if (Array.isArray(j) && k.indexOf('hist_') === 0) j = { total: j.length, primeros: j.slice(0, 3), ultimos: j.slice(-5) };
+            out.data912[k] = rr.ok ? j : { error: 'HTTP ' + rr.status };
+          } catch (e) { out.data912[k] = { error: e.message }; }
+        }
+        out.creditos = creditos;
+        return { body: out, creditos };
+      }, now);
+      return new Response(JSON.stringify(Object.assign({}, r.body, { _meta: r.meta })), { status: 200, headers: {
+        'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
+        'Content-Disposition': 'attachment; filename="extraccion_bonos_1816_data912.json"' } });
     }
     if (q === 'bal') {
       const r = await call('/creditos/balance', {});
