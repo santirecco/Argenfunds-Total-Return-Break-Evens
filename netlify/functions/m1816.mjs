@@ -1,11 +1,15 @@
 // Intermediario para la API de 1816 (https://api.1816.com.ar/v1).
+import { getStore } from '@netlify/blobs';
 // La API Key vive en la variable de entorno API_1816_KEY de Netlify: nunca
 // llega al navegador, al HTML ni al repo. Esta función pide el token de 24 h,
 // atiende SOLO los pedidos predefinidos de abajo y deja la respuesta guardada
-// en la red de Netlify (CDN) para que todos los visitantes compartan la misma
-// copia: 1816 se consulta como máximo una vez por período, no una por visita.
+// en Netlify Blobs (almacenamiento del sitio) con su vencimiento: mientras no
+// venza, TODAS las visitas y recargas reciben esa copia y 1816 no se consulta.
+// Además lleva la cuenta de créditos del día y deja de consultar al llegar al
+// tope (API_1816_TOPE, por defecto 20.000), sirviendo el último dato guardado.
+// Fuente única: BYMA (la que 1816 usa por defecto).
 //
-//   ?q=snap&grupo=sob|prov&fuente=byma|homo&moneda=mep|ccl[&dia=prev]
+//   ?q=snap&grupo=sob|prov&moneda=mep|ccl[&dia=prev]
 //   ?q=hist&ticker=AL30           (TIR de 1 año, MEP, fuente BYMA)
 //   ?q=bal                         (saldo de créditos, no consume créditos)
 
@@ -95,6 +99,35 @@ function ttlHist(now) { // la historia cambia una vez por día: hasta las 18:30 
   return Math.max(3600, Math.round((corte - now.getTime()) / 1000));
 }
 
+// ── Copia guardada + tope diario de créditos (Netlify Blobs) ────────────────
+function tope() { const v = Number(env('API_1816_TOPE')); return v > 0 ? v : 20000; }
+function store() { try { return getStore('m1816'); } catch (e) { return null; } }
+async function guardado(key, ttlSeg, producir, now) {
+  const st = store(), hoyAR = isoAR(now);
+  let hit = null, usados = 0;
+  if (st) {
+    try { hit = await st.get(key, { type: 'json' }); } catch (e) {}
+    if (hit && hit.exp > now.getTime()) return { body: hit.body, meta: { origen: 'guardado', leido: hit.at, proxima: new Date(hit.exp).toISOString() } };
+    try { const c = await st.get('creditos-' + hoyAR, { type: 'json' }); usados = (c && c.usados) || 0; } catch (e) {}
+    if (usados >= tope()) {
+      if (hit) return { body: hit.body, meta: { origen: 'tope', leido: hit.at, usadosHoy: usados, tope: tope() } };
+      throw httpErr(429, 'Se alcanzó el tope diario de ' + tope() + ' créditos de 1816 y no hay datos guardados para este pedido.');
+    }
+  }
+  try {
+    const r = await producir();
+    const at = now.toISOString(), exp = now.getTime() + ttlSeg * 1000;
+    if (st) {
+      try { await st.setJSON(key, { body: r.body, at, exp }); } catch (e) {}
+      try { await st.setJSON('creditos-' + hoyAR, { usados: usados + (r.creditos || 0) }); } catch (e) {}
+    }
+    return { body: r.body, meta: { origen: '1816', leido: at, proxima: new Date(exp).toISOString(), creditos: r.creditos, usadosHoy: usados + (r.creditos || 0), tope: tope(), sinAlmacen: !st } };
+  } catch (e) {
+    if (hit) return { body: hit.body, meta: { origen: 'viejo', leido: hit.at, error: e.message } };
+    throw e;
+  }
+}
+
 function vacio(inst) { return !Object.values(inst || {}).some((o) => o && o.precioClean != null); }
 
 function respond(status, body, ttl) {
@@ -102,7 +135,7 @@ function respond(status, body, ttl) {
   if (ttl) {
     h['Cache-Control'] = 'public, max-age=60';
     h['Netlify-CDN-Cache-Control'] = 'public, durable, s-maxage=' + ttl + ', stale-while-revalidate=120';
-    h['Netlify-Vary'] = 'query=q|grupo|fuente|moneda|dia|ticker';
+    h['Netlify-Vary'] = 'query=q|grupo|moneda|dia|ticker';
   } else h['Cache-Control'] = 'no-store';
   return new Response(JSON.stringify(body), { status, headers: h });
 }
@@ -111,35 +144,46 @@ export default async (req) => {
   const u = new URL(req.url), p = u.searchParams, q = p.get('q'), now = new Date();
   try {
     if (q === 'snap') {
-      const tickers = GRUPOS[p.get('grupo')];
+      const grupo = p.get('grupo'), tickers = GRUPOS[grupo];
       if (!tickers) return respond(400, { error: 'grupo inválido' });
-      const fuente = p.get('fuente') === 'homo' ? 'homo-1816' : 'byma';
       const moneda = p.get('moneda') === 'ccl' ? 'ccl' : 'mep';
       const prev = p.get('dia') === 'prev';
-      // Antes de la apertura, en feriados o fines de semana el día pedido viene vacío:
-      // se retrocede de a un día hábil (máximo 4) hasta encontrar operaciones.
-      let fecha = prev ? prevHabil(now) : (habil(now) ? now : prevHabil(now));
-      let out = null, credits = 0;
-      for (let i = 0; i < 4; i++) {
-        const r = await call('/mercado/indicadores', { tickers, campos: CAMPOS, fuente, moneda, plazo: 1, fechaOperacion: isoAR(fecha) });
-        credits += r.credits || 0; out = r.json;
-        if (!vacio(out && out.instrumentos)) break;
-        fecha = prevHabil(fecha);
-      }
-      return respond(200, Object.assign({}, out, { _meta: { leido: now.toISOString(), creditos: credits || null, grupo: p.get('grupo'), dia: prev ? 'prev' : 'hoy' } }), ttlSnap(now, prev));
+      const ttl = ttlSnap(now, prev);
+      const r = await guardado('snap-' + grupo + '-' + moneda + (prev ? '-prev' : ''), ttl, async () => {
+        // Antes de la apertura, fines de semana y feriados el día pedido viene vacío:
+        // se empieza por el último día hábil y se retrocede (máximo 4) hasta encontrar operaciones.
+        let fecha = prev ? prevHabil(now) : (habil(now) && minutosAR(now) >= 10 * 60 + 55 ? now : prevHabil(now));
+        let out = null, creditos = 0;
+        for (let i = 0; i < 4; i++) {
+          const x = await call('/mercado/indicadores', { tickers, campos: CAMPOS, fuente: 'byma', moneda, plazo: 1, fechaOperacion: isoAR(fecha) });
+          creditos += x.credits || tickers.length * CAMPOS.length; out = x.json;
+          if (!vacio(out && out.instrumentos)) break;
+          fecha = prevHabil(fecha);
+        }
+        return { body: out, creditos };
+      }, now);
+      return respond(200, Object.assign({}, r.body, { _meta: Object.assign({ grupo, dia: prev ? 'prev' : 'hoy' }, r.meta) }), Math.min(ttl, 600));
     }
     if (q === 'hist') {
       const t = String(p.get('ticker') || '');
       if (!HIST_OK.has(t.toUpperCase())) return respond(400, { error: 'ticker no permitido' });
       const orig = SOB.concat(PROV).find((x) => x.toUpperCase() === t.toUpperCase());
-      const desde = new Date(now.getTime() - 364 * 86400e3);
-      const r = await call('/mercado/series', { tickers: [orig], campos: ['tea'], fuente: 'byma', moneda: 'mep', plazo: 1,
-        fechaInicial: isoAR(desde), fechaFinal: isoAR(now) });
-      return respond(200, Object.assign({}, r.json, { _meta: { leido: now.toISOString(), creditos: r.credits } }), ttlHist(now));
+      const ttl = ttlHist(now);
+      const r = await guardado('hist-' + orig.toUpperCase(), ttl, async () => {
+        const desde = new Date(now.getTime() - 364 * 86400e3);
+        const x = await call('/mercado/series', { tickers: [orig], campos: ['tea'], fuente: 'byma', moneda: 'mep', plazo: 1,
+          fechaInicial: isoAR(desde), fechaFinal: isoAR(now) });
+        const ins = (x.json && x.json.instrumentos) || {}, k = Object.keys(ins)[0];
+        const n = k && ins[k].tea ? ins[k].tea.length : 250;
+        return { body: x.json, creditos: x.credits || n };
+      }, now);
+      return respond(200, Object.assign({}, r.body, { _meta: r.meta }), Math.min(ttl, 3600));
     }
     if (q === 'bal') {
       const r = await call('/creditos/balance', {});
-      return respond(200, r.json, 300);
+      const st = store(); let usados = null;
+      if (st) { try { const c = await st.get('creditos-' + isoAR(now), { type: 'json' }); usados = (c && c.usados) || 0; } catch (e) {} }
+      return respond(200, Object.assign({}, r.json, { _monitor: { usadosHoy: usados, tope: tope() } }), 300);
     }
     return respond(400, { error: 'pedido no reconocido' });
   } catch (e) {
